@@ -217,6 +217,7 @@ def build_output(results, outdir, label=True):
 
 
 def contact_sheet(picked, outdir, cols=4, thumb=(640, 360)):
+    cols = max(1, min(cols, len(picked)))  # short runs must not pad with empty cells
     rows = (len(picked) + cols - 1) // cols
     w, h = thumb
     sheet = Image.new("RGB", (cols * w, rows * (h + 20)), "black")
