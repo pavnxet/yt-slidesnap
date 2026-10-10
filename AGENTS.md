@@ -35,9 +35,14 @@ python slidesnap.py selftest
 - **The answer timestamp is a ceiling, never a target.** `extract_window` derives the
   sampling rate from `answer - question` precisely so the last candidate lands before the
   answer. Keep that property - it is what makes the output answer-free.
-- **Keep the timestamp parser loose.** It only needs a leading id and the first two
-  `hh:mm:ss` stamps on a line. Do not start matching on the words `Question` / `Answer`;
-  users paste whatever their source gave them.
+- **Keep the timestamp parser loose.** It needs a leading id and one or more `hh:mm:ss`
+  stamps on a line. Do not start matching on the words `Question` / `Answer`; users paste
+  whatever their source gave them.
+- **The ceiling is the *earliest* later stamp, not the second stamp.** Pasted tables often
+  carry several later timestamps per row (answer discussion, correct-option reveal) in an
+  arbitrary column order. Taking the second stamp would hand you a window that runs past the
+  answer and across the next question, which also destroys the median auto-pick. Ids must
+  also survive a leading `|`.
 - **One ffmpeg pass per slide**, not one per candidate - `-vf fps=K/span -frames:v K`.
   Each invocation re-reads the MP4 header over HTTP, so invocation count dominates runtime.
 - **Sample early in the window.** Late frames catch the presenter's annotations, which

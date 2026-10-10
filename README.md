@@ -39,12 +39,20 @@ one. (`yt-dlp` is used to resolve the stream and is installed as a dependency.)
 
 ## Quick start
 
-Write your timestamps in a file — anything with an id and one or two `hh:mm:ss` stamps per
+Write your timestamps in a file — anything with an id and at least one `hh:mm:ss` stamp per
 line works, so you can paste them however you already have them:
 
 ```
 Q22: Question 01:34:21 | Answer 01:34:53 (C)
 Q23: Question 01:38:45 | Answer 01:39:16 (D)
+```
+
+Markdown tables work too, including ones with several later timestamps per row:
+
+```
+| Q# | Question Start | Correct Option Timestamp | Answer Start | Correct Option |
+| -- | -------------- | ------------------------ | ------------ | -------------- |
+| Q19 | 01:41:04 | 01:44:16 | 01:41:27 | C |
 ```
 
 Then:
@@ -59,9 +67,10 @@ yt-slidesnap run "<video-url>" --text "Q22: Question 01:34:21 | Answer 01:34:53 
 cat timestamps.txt | yt-slidesnap run "<video-url>"
 ```
 
-The **first** stamp is when the slide appears. The **second** is when the answer is
-revealed — it is used *only* as a ceiling, and no frame is ever taken at or past it, so an
-answer cannot leak into the PDF. A second stamp is optional.
+The **first** stamp on a line is when the slide appears. Every later stamp is a ceiling and
+the **earliest** one wins. So in the table above the window is `01:41:04 → 01:41:27` (Answer
+Start), not `→ 01:44:16` — no frame is ever taken at or past the earliest later event, so an
+answer cannot leak into the PDF, and the window can't drift across the next question.
 
 See [`examples/timestamps.txt`](examples/timestamps.txt) for a full list.
 

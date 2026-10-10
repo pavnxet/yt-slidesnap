@@ -8,9 +8,11 @@ screen. It saves a clean frame of each one and stitches them into a PDF.
     yt-slidesnap run <url> --text "Q22: Question 01:34:21 | Answer 01:34:53 (C)"
     Get-Content timestamps.txt | yt-slidesnap run <url>
 
-Each line needs an id and one or two hh:mm:ss stamps. The first is when the slide
-appears, the second is when the answer is revealed - it is used only as a ceiling
-and is never captured, so answers cannot leak into the PDF.
+Each line needs an id and at least one hh:mm:ss stamp. The first is when the slide
+appears. Any stamps after it are ceilings and the earliest one wins, so a table
+listing several later times (answer discussion, correct-option reveal) in any
+column order still yields a clean window. Ceilings are never captured, so answers
+cannot leak into the PDF.
 
 No video is downloaded. Frames are read straight out of the stream over HTTP byte
 ranges, so a 2-hour lecture costs a few hundred KB per slide.
@@ -54,11 +56,28 @@ def hms(text: str) -> int:
     return h * 3600 + m * 60 + s
 
 
-def parse_block(text: str):
-    """Parse a pasted timestamp list -> [(id, question_sec, answer_sec_or_None)].
+def parse_id(line: str, fallback: str) -> str:
+    """Pull the slide id off a line, markdown table cell or plain prose."""
+    first_cell = line.strip().lstrip("|").split("|")[0].strip()
+    m = re.fullmatch(r"(?:Q\s*)?(\d+)", first_cell, re.I)
+    if m:  # markdown row like "| Q19 | 01:41:04 | ..."
+        return f"Q{m.group(1)}"
+    m = ID.match(line)
+    if not m:  # no recognisable id: number it by position
+        return fallback
+    got = m.group(1)
+    return got.upper() if got.upper().startswith("Q") else f"Q{got}"
 
-    Deliberately loose: it only needs the first two hh:mm:ss stamps on a line and
-    a leading id, so it survives whatever prose surrounds them.
+
+def parse_block(text: str):
+    """Parse a pasted timestamp list -> [(id, slide_sec, ceiling_sec_or_None)].
+
+    Loose on purpose: any line with an id and at least one hh:mm:ss is a slide.
+
+    The first stamp is when the slide appears. The ceiling is the **earliest**
+    stamp after it, not simply the second one - tables often carry several later
+    stamps (answer discussion, correct-option reveal) in any column order, and the
+    slide is only clean until the first thing that happens to it.
     """
     out = []
     for line in text.splitlines():
@@ -67,16 +86,9 @@ def parse_block(text: str):
         stamps = STAMP.findall(line)
         if not stamps:
             continue
-        m = ID.match(line)
-        qid = m.group(1) if m else str(len(out) + 1)
-        qid = qid.upper() if qid.upper().startswith("Q") else f"Q{qid}"
-        if len(stamps) >= 2:
-            start, end = hms(stamps[0]), hms(stamps[1])
-            if end <= start:  # stamp order is wrong; don't trust the ceiling
-                end = None
-        else:
-            start, end = hms(stamps[0]), None
-        out.append((qid, start, end))
+        start = hms(stamps[0])
+        later = [hms(s) for s in stamps[1:] if hms(s) > start]
+        out.append((parse_id(line, f"Q{len(out) + 1}"), start, min(later) if later else None))
     return out
 
 
@@ -280,6 +292,25 @@ def cmd_selftest(_args):
     assert parse_block("Q1 00:10:00 | 00:09:00")[0][2] is None
     # no answer stamp at all -> open-ended window
     assert parse_block("Q1 00:10:00")[0] == ("Q1", 600, None)
+
+    # markdown table with three stamps per row in a non-chronological column
+    # order: the ceiling must be the EARLIEST later stamp, not the second column
+    table = (
+        "| Q# | Question Start | Correct Option Timestamp | Answer Start | Correct Option |\n"
+        "| -- | -------------- | ------------------------ | ------------ | -------------- |\n"
+        "| Q19 | 01:41:04 | 01:44:16 | 01:41:27 | C |\n"
+        "| Q26 | 02:13:05 | 02:17:51 | 02:13:19 | D |\n"
+    )
+    rows = parse_block(table)
+    assert len(rows) == 2, rows  # header + separator have no stamps
+    assert rows[0] == ("Q19", 6064, 6087), rows[0]
+    assert rows[1] == ("Q26", 7985, 7999), rows[1]
+
+    # ids survive a leading pipe and come out normalised
+    assert parse_id("| Q19 | 01:41:04 |", "Q1") == "Q19"
+    assert parse_id("| q7 | 00:01:00 |", "Q1") == "Q7"
+    assert parse_id("Q22: Question 01:34:21 | Answer 01:34:53 (C)", "Q1") == "Q22"
+    assert parse_id("no id here 00:01:00", "Q9") == "Q9"
     assert video_id("https://www.youtube.com/watch?v=6R4jGTw5owM") == "6R4jGTw5owM"
     assert video_id("https://youtu.be/6R4jGTw5owM?t=10") == "6R4jGTw5owM"
     assert is_youtube("https://youtu.be/6R4jGTw5owM")
