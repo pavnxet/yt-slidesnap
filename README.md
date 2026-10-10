@@ -23,15 +23,31 @@ check: ./slidesnap-out/XXXXXXXXXXX/auto_picked.png
 
 ## Install
 
+Pick **one**. The only difference is whether you get a `yt-slidesnap` command, or type
+`python slidesnap.py`.
+
+**A. Get the `yt-slidesnap` command** (recommended)
+
 ```bash
-pipx install git+https://github.com/pavnxet/yt-slidesnap
+pipx install git+https://github.com/pavnxet/yt-slidesnap     # isolated, cleanest
 # or
 pip install git+https://github.com/pavnxet/yt-slidesnap
-# or just clone it and use the script directly
+```
+
+**B. Work from a clone**
+
+```bash
 git clone https://github.com/pavnxet/yt-slidesnap && cd yt-slidesnap
 pip install -r requirements.txt
-python slidesnap.py --help
+python slidesnap.py --help          # NOTE: there is no `yt-slidesnap` command yet
 ```
+
+Want the short command *and* a clone you can edit? Run `pip install -e .` inside the clone.
+That creates `yt-slidesnap` and still tracks your local edits.
+
+> Every command below is written as `yt-slidesnap ...`. **If you took path B and did not run
+> `pip install -e .`, use `python slidesnap.py ...` instead** — identical arguments. This is
+> the single most common trip-up.
 
 **You do not need ffmpeg installed.** A full ffmpeg build ships inside
 [`imageio-ffmpeg`](https://pypi.org/project/imageio-ffmpeg/) and the tool always uses that
@@ -81,6 +97,7 @@ Prefer clicking to typing flags? There's a local web page — no account, no clo
 
 ```bash
 yt-slidesnap serve
+python slidesnap.py serve      # if you didn't install the command
 ```
 
 It opens `http://127.0.0.1:8765` in your browser. Paste the URL and the timestamps, click
