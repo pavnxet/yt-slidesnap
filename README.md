@@ -90,6 +90,50 @@ answer cannot leak into the PDF, and the window can't drift across the next ques
 
 See [`examples/timestamps.txt`](examples/timestamps.txt) for a full list.
 
+## Timestamp formats
+
+Paste whatever you have. All of these mean **1h 34m 21s**:
+
+| You paste | Read as |
+|---|---|
+| `1:34:21` `01:34:21` | H:M:S |
+| `01:34:21.500` | H:M:S, fraction ignored |
+| `94:21` | **M:S** — 94 minutes |
+| `1h34m21s` `1h 34m 21s` `1h34m` `2m3s` `90s` `1 hour 2 minutes` | durations |
+| `?t=5661` in a URL | seconds |
+| `5661` — only where the shape says it is a time | seconds |
+
+Ids are just as loose: `Q22`, `q22`, `q 22`, `Question 22`, `Slide 3`, `#22`, `[22]`, `22.`,
+`22)`. A single word before the timestamp (`Intro: 00:05:00`) becomes the id, and anything
+unrecognised is numbered by position. Rows work as markdown tables, or `;` / `,` separated.
+Input order does not matter — output is sorted by time.
+
+**Two rules worth knowing**, both because guessing wrong would silently capture the wrong
+frame:
+
+- **`1:34` is one minute thirty-four, not one hour thirty-four.** A two-part stamp is always
+  M:S. For an hour, write `1:34:21` or `1h34m`.
+- **Plain integers are only seconds when they cannot be an id.** `Q22 5661 5693` is
+  unambiguous; a lone `5661` on a line is treated as seconds, but `22` stays a question
+  number. When in doubt, write `5661s`.
+
+Check before you spend a run on it:
+
+```bash
+yt-slidesnap run "<url>" --file timestamps.txt --dry-run
+```
+
+```
+  Q19        1:41:04 -> 1:41:27         23s
+  Q20        1:47:56 -> 1:48:23         27s
+  Q23        2:04:12 -> 2:04:15         3s
+
+8 slide(s) parsed - nothing extracted (--dry-run)
+```
+
+Every extraction also prints the window it understood, so a misread shows up in the log
+(`Q19 [1:41:04-1:41:27]: picked 7/8`).
+
 ## Web UI
 
 Prefer clicking to typing flags? There's a local web page — no account, no cloud, binds to
@@ -162,6 +206,7 @@ neither ever covers the question. Turn either off with `--no-label` / `--no-wate
 | `--format SEL` | `bv*[height<=1080]/...` | yt-dlp format selector |
 | `--no-label` | off | don't caption pages with `Q22  at 1:34:21` |
 | `--no-watermark` | off | don't stamp the repo line at the foot of pages |
+| `--dry-run` | off | show how the timestamps were read, then exit |
 
 ## Troubleshooting
 

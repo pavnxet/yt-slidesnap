@@ -39,7 +39,7 @@ import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # bundled full build; never PATH ffmpeg
 UA = "Mozilla/5.0"
@@ -54,8 +54,6 @@ YOUTUBE_CLIENT = "android"
 class SnapError(Exception):
     """A failure the user should read, rather than a traceback."""
 
-STAMP = re.compile(r"\d{1,2}:\d{2}:\d{2}")
-ID = re.compile(r"^\s*(?:question\s*)?(Q?\d+)\b", re.I)
 YT_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{11})")
 
 # Branding. The heart is U+2764 only - the emoji variation selector U+FE0F is a
@@ -79,47 +77,199 @@ CAP_H, MARK_H, TEXT = 30, 28, 15  # page header/footer strip heights, text size
 
 
 # --------------------------------------------------------------------------- input
+#
+# Timestamps are accepted in whatever shape they were pasted. All of these mean
+# 1h34m21s:  1:34:21   01:34:21.500   94:21*   1h34m21s   1h 34m 21s   5661s
+#            ?t=5661   5661+
+#
+#   * two-part A:B is read as M:S, never H:M - see README
+#   + bare integers are seconds only where the shape says they are times, never
+#     where they could be a question number
+
+CLOCK = re.compile(
+    r"\b(\d{1,3}):([0-5]?\d)(?::([0-5]?\d))?(?:[.,]\d{1,3})?(?![\d:])")
+UNIT_PAIR = re.compile(
+    r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])", re.I)
+UNIT_SEC = {"h": 3600, "m": 60, "s": 1}
+UNIT_RANK = {"h": 0, "m": 1, "s": 2}
+URI_T = re.compile(r"[?&]t=(\d{1,6})\b")
+BARE = re.compile(r"(?<![\d:\w.])(\d{2,6})(?![\d:\w.])")
+
+# ids: Q22 / q22 / q 22 / Question 22 / Slide 3 / #22 / [22] / 22. / 22)
+ID_HEAD = r"^\s*[\[\(]?\s*(?:q(?:uestion)?|ques|slide|no|num)?\s*[.:\-)\]#]*\s*(\d{1,4})"
+LEAD_ID = re.compile(ID_HEAD + r"\s*[.:\-)\]#]*\s", re.I)
+CELL_ID = re.compile(ID_HEAD + r"\s*[.:\-)\]#]*\s*$", re.I)
+NOISE = {"question", "answer", "ans", "time", "start", "end", "timestamp", "q",
+         "no", "num", "slide", "at", "from", "to", "and"}
+WORDY = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,23}")  # one filename-safe word
 
 
 def hms(text: str) -> int:
+    """'H:MM:SS' -> seconds. For known-good strings; parse_block is looser."""
     h, m, s = (int(p) for p in text.split(":"))
     return h * 3600 + m * 60 + s
 
 
-def parse_id(line: str, fallback: str) -> str:
-    """Pull the slide id off a line, markdown table cell or plain prose."""
-    first_cell = line.strip().lstrip("|").split("|")[0].strip()
-    m = re.fullmatch(r"(?:Q\s*)?(\d+)", first_cell, re.I)
-    if m:  # markdown row like "| Q19 | 01:41:04 | ..."
-        return f"Q{m.group(1)}"
-    m = ID.match(line)
-    if not m:  # no recognisable id: number it by position
+def clock(sec: int) -> str:
+    """seconds -> 'H:MM:SS'."""
+    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def _unit_stamps(line):
+    """'1h34m21s' / '1h 34m' / '90s' -> [(start, end, seconds)].
+
+    Adjacent number+unit pairs merge into ONE stamp only when the units descend
+    h -> m -> s without repeating, which is what a single duration looks like.
+    '5661s 5693s' is two timestamps, not 11354 seconds.
+    """
+    pairs = [(m.start(), m.end(), int(m.group(1)), m.group(2)[0].lower())
+             for m in UNIT_PAIR.finditer(line)]
+    out, i = [], 0
+    while i < len(pairs):
+        start, end, val, unit = pairs[i]
+        total, rank = val * UNIT_SEC[unit], UNIT_RANK[unit]
+        j = i + 1
+        while j < len(pairs):
+            n_start, n_end, n_val, n_unit = pairs[j]
+            if line[end:n_start].strip(" \t,"):  # something in between: separate
+                break
+            if UNIT_RANK[n_unit] <= rank:  # same or rising unit: separate
+                break
+            total += n_val * UNIT_SEC[n_unit]
+            rank, end, j = UNIT_RANK[n_unit], n_end, j + 1
+        out.append((start, end, total))
+        i = j
+    return out
+
+
+def _stamps(line):
+    """Every timestamp on a line -> [(start, end, seconds)], de-overlapped.
+
+    A two-part clock is M:S and a three-part one is H:M:S, so 94:21 is 94 minutes
+    and 1:34:21 is an hour and a half. Fractional seconds are dropped - the frame
+    granularity that matters here is 1/30s at worst and ffmpeg seeks by keyframe.
+    """
+    raw = []
+    for m in CLOCK.finditer(line):
+        a, b, c = m.group(1), m.group(2), m.group(3)
+        sec = int(a) * 3600 + int(b) * 60 + int(c) if c is not None else int(a) * 60 + int(b)
+        raw.append((m.start(), m.end(), sec))
+    raw += _unit_stamps(line)
+    for m in URI_T.finditer(line):
+        raw.append((m.start(1), m.end(1), int(m.group(1))))
+
+    out = []
+    for span in sorted(raw):
+        if out and span[0] < out[-1][1]:  # a token sitting inside one already taken
+            continue
+        out.append(span)
+    return out
+
+
+def _row_cells(line):
+    """A markdown / semicolon / CSV row -> its cells, else None."""
+    s = line.strip()
+    if s.startswith("|") or (s.endswith("|") and s.count("|") >= 2):
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        return cells if len(cells) >= 2 else None
+    for sep in (";", ","):
+        if s.count(sep) >= 2:
+            cells = [c.strip() for c in s.split(sep)]
+            if CELL_ID.match(cells[0]):  # a bare id cell, not prose full of commas
+                return cells
+    return None
+
+
+def _id_span(line):
+    """Character range of a markdown row's first cell, so its number isn't a time."""
+    i = line.find("|")
+    if i < 0:
+        return None
+    j = line.find("|", i + 1)
+    if j < 0:
+        return None
+    a, b = i + 1, j
+    while a < b and line[a].isspace():
+        a += 1
+    while b > a and line[b - 1].isspace():
+        b -= 1
+    return (a, b)
+
+
+def _label(line, row, stamps, fallback):
+    """Slide id: a row's first cell, a leading Q-number, or a short word label."""
+    if row:
+        cell = row[0]
+        m = CELL_ID.match(cell)
+        if m:
+            return f"Q{m.group(1)}"
+        if 0 < len(cell) <= 24 and not cell[0].isdigit():
+            return cell  # a worded row label, e.g. "Intro"
         return fallback
-    got = m.group(1)
-    return got.upper() if got.upper().startswith("Q") else f"Q{got}"
+    m = LEAD_ID.match(line)
+    if m and not any(a <= m.start(1) < b for a, b, _ in stamps):
+        return f"Q{m.group(1)}"  # not a bare-seconds stamp mistaken for an id
+    if stamps:
+        head = line[:stamps[0][0]].strip(" \t-–—:|.,()]#")
+        # must actually look like a label, or a URL's prefix becomes an id
+        if WORDY.fullmatch(head) and head.lower() not in NOISE:
+            return head  # e.g. "Intro - 00:05:00"
+    return fallback
 
 
 def parse_block(text: str):
     """Parse a pasted timestamp list -> [(id, slide_sec, ceiling_sec_or_None)].
 
-    Loose on purpose: any line with an id and at least one hh:mm:ss is a slide.
+    The first stamp on a line is when the slide appears. The ceiling is the
+    **earliest** stamp after it, not simply the second one: pasted tables carry
+    several later stamps (answer discussion, correct-option reveal) in any column
+    order, and a slide is only clean until the first thing happens to it.
 
-    The first stamp is when the slide appears. The ceiling is the **earliest**
-    stamp after it, not simply the second one - tables often carry several later
-    stamps (answer discussion, correct-option reveal) in any column order, and the
-    slide is only clean until the first thing that happens to it.
+    Ids are de-duplicated and the result is sorted by start time.
     """
+    # Windows editors happily save as "UTF-8 with BOM"; left in place it becomes
+    # part of line 1 and quietly costs that line its id.
+    text = text.replace("\ufeff", "")
     out = []
     for line in text.splitlines():
         if not line.strip():
             continue
-        stamps = STAMP.findall(line)
+        row = _row_cells(line)
+        stamps = _stamps(line)
+
+        if not stamps:
+            # No clock/unit stamps. Plain integers are seconds only when the shape
+            # says so: several of them, and none of them the row's id cell.
+            span = _id_span(line)
+            big = []
+            for m in BARE.finditer(line):
+                if span and span[0] <= m.start(1) < span[1]:
+                    continue
+                if int(m.group(1)) >= 60:
+                    big.append((m.start(1), m.end(1), int(m.group(1))))
+            if len(big) >= 2:
+                stamps = big[:2]
+
         if not stamps:
             continue
-        start = hms(stamps[0])
-        later = [hms(s) for s in stamps[1:] if hms(s) > start]
-        out.append((parse_id(line, f"Q{len(out) + 1}"), start, min(later) if later else None))
-    return out
+        start = stamps[0][2]
+        later = [s[2] for s in stamps[1:] if s[2] > start]
+        out.append((_label(line, row, stamps, f"Q{len(out) + 1}"), start,
+                    min(later) if later else None))
+
+    seen, uniq = set(), []
+    for item in out:
+        if item not in seen:  # the same line pasted twice
+            seen.add(item)
+            uniq.append(item)
+
+    # duplicate ids would overwrite each other's frame file
+    counts, fixed = {}, []
+    for qid, start, end in uniq:
+        counts[qid] = counts.get(qid, 0) + 1
+        fixed.append((qid if counts[qid] == 1 else f"{qid}-{counts[qid]}", start, end))
+
+    return sorted(fixed, key=lambda it: it[1])
 
 
 def is_youtube(url: str) -> bool:
@@ -342,7 +492,9 @@ def run_pipeline(url, items, outdir, frames=8, workers=4, client=YOUTUBE_CLIENT,
         if scores is not None:
             # a picked score close to the worst means every candidate was dirty
             detail = f" (error {scores.min():.1f} vs worst {scores.max():.1f})"
-        say(f"{qid}: {note}{detail}")
+        # show the window we understood, so a misread timestamp is visible here
+        window = f"{clock(start)}-{clock(item[2])}" if item[2] else clock(start)
+        say(f"{qid} [{window}]: {note}{detail}")
         return qid, path, scores, start, note
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -375,6 +527,15 @@ def cmd_run(args):
     print(f"out  : {outdir}")
     print(f"found: {len(items)} slides ({items[0][0]}..{items[-1][0]})")
 
+    if args.dry_run:
+        # the parser accepts many shapes, so show what it decided before spending
+        # a run on it - a misread 1:34 as M:S instead of H:M is silent otherwise
+        for qid, start, end in items:
+            span = f"{clock(start)} -> {clock(end)}" if end else clock(start)
+            print(f"  {qid:<10} {span:<26} {f'{end - start}s' if end else 'open'}")
+        print(f"\n{len(items)} slide(s) parsed - nothing extracted (--dry-run)")
+        return
+
     try:
         pdf, sheet, picked = run_pipeline(
             args.url, items, outdir, frames=args.frames, workers=args.workers,
@@ -398,12 +559,14 @@ def cmd_selftest(_args):
         "\n"
         "Q38: Question 00:05:00 (no answer stamp)\n"
     )
-    got = parse_block(sample)
-    assert got[0] == ("Q22", 5661, 5693), got[0]
-    assert got[1] == ("Q23", 5925, 5956), got[1]
-    assert got[2] == ("Q29", 7304, 7310), got[2]
-    assert got[3] == ("Q37", 8408, 8412), got[3]
-    assert got[4] == ("Q38", 300, None), got[4]
+    # keyed by id, not position: output is sorted by start time, so the sample's
+    # Q38 at 00:05:00 legitimately sorts ahead of the rest
+    got = {q: (s, e) for q, s, e in parse_block(sample)}
+    assert got["Q22"] == (5661, 5693), got
+    assert got["Q23"] == (5925, 5956), got
+    assert got["Q29"] == (7304, 7310), got
+    assert got["Q37"] == (8408, 8412), got
+    assert got["Q38"] == (300, None), got
     assert len(got) == 5, got
     assert hms("02:20:12") == 8412
     assert hms("00:00:00") == 0
@@ -425,11 +588,59 @@ def cmd_selftest(_args):
     assert rows[0] == ("Q19", 6064, 6087), rows[0]
     assert rows[1] == ("Q26", 7985, 7999), rows[1]
 
-    # ids survive a leading pipe and come out normalised
-    assert parse_id("| Q19 | 01:41:04 |", "Q1") == "Q19"
-    assert parse_id("| q7 | 00:01:00 |", "Q1") == "Q7"
-    assert parse_id("Q22: Question 01:34:21 | Answer 01:34:53 (C)", "Q1") == "Q22"
-    assert parse_id("no id here 00:01:00", "Q9") == "Q9"
+    # --- accepted timestamp shapes -------------------------------------------
+    def one(line):
+        got = parse_block(line)
+        return got[0] if got else None
+
+    # clock: three parts is H:M:S, two parts is M:S
+    assert one("1:34:21") == ("Q1", 5661, None), one("1:34:21")
+    assert one("01:34:21.500") == ("Q1", 5661, None), one("01:34:21.500")
+    assert one("34:21") == ("Q1", 2061, None), one("34:21")   # M:S, never H:M
+    assert one("94:21") == ("Q1", 5661, None), one("94:21")   # 94 minutes
+    assert one("0:00:01") == ("Q1", 1, None), one("0:00:01")
+    # units, including adjacent parts of one duration
+    assert one("1h34m21s") == ("Q1", 5661, None), one("1h34m21s")
+    assert one("1h 34m 21s") == ("Q1", 5661, None), one("1h 34m 21s")
+    assert one("1h34m") == ("Q1", 5640, None), one("1h34m")
+    assert one("2m3s") == ("Q1", 123, None), one("2m3s")
+    assert one("90s") == ("Q1", 90, None), one("90s")
+    assert one("1 hour 2 minutes") == ("Q1", 3720, None), one("1 hour 2 minutes")
+    # two durations in a row stay two stamps - 5661s 5693s is not 11354s
+    assert one("Q22 5661s 5693s") == ("Q22", 5661, 5693), one("Q22 5661s 5693s")
+    # seconds, bare or from a URL
+    assert one("https://youtu.be/xyz?t=5661") == ("Q1", 5661, None)
+    assert one("https://youtu.be/xyz?t=1h34m21s") == ("Q1", 5661, None)
+    assert one("Q22 5661 5693") == ("Q22", 5661, 5693), one("Q22 5661 5693")
+    assert one("5661 5693") == ("Q1", 5661, 5693), one("5661 5693")  # times, not ids
+
+    # --- accepted id shapes ---------------------------------------------------
+    for text in ("Q22: 01:34:21", "q22 01:34:21", "q 22 - 01:34:21",
+                 "Question 22: 01:34:21", "[22] 01:34:21", "22. 01:34:21",
+                 "22) 01:34:21", "#22 01:34:21"):
+        assert one(text)[0] == "Q22", (text, one(text))
+    assert one("Slide 3 01:34:21")[0] == "Q3", one("Slide 3 01:34:21")
+    assert one("Intro: 00:05:00")[0] == "Intro", one("Intro: 00:05:00")
+    assert one("no id here 00:05:00")[0] == "Q1", one("no id here 00:05:00")
+
+    # --- row shapes -----------------------------------------------------------
+    assert one("| Q19 | 01:41:04 | 01:44:16 | 01:41:27 | C |") == ("Q19", 6064, 6087)
+    assert one("| Q19 | 1:41:04 | 1:41:27 |") == ("Q19", 6064, 6087)
+    assert one("Q22,1:34:21,1:34:53") == ("Q22", 5661, 5693)
+    assert one("Q22;1:34:21;1:34:53") == ("Q22", 5661, 5693)
+    assert one("| 100 | 5661 | 5693 |") == ("Q100", 5661, 5693)  # id cell isn't a time
+
+    # --- housekeeping ---------------------------------------------------------
+    # a repeated id is suffixed so frame files cannot overwrite each other, a
+    # duplicated line is dropped, and output is sorted by start time
+    dup = parse_block("Q5 00:10:00\nQ5 00:10:00\nQ5 00:20:00")
+    assert [d[0] for d in dup] == ["Q5", "Q5-2"], dup
+    assert [j[0] for j in parse_block("Q2 00:20:00\nQ1 00:10:00")] == ["Q1", "Q2"]
+    # a heading or separator row is not a slide
+    assert parse_block("just a heading\n---\n| -- | --- |") == []
+    # a UTF-8 BOM must not cost the first line its id
+    assert parse_block("\ufeffQ22: Question 01:34:21 | Answer 01:34:53 (C)")[0] == \
+        ("Q22", 5661, 5693)
     assert video_id("https://www.youtube.com/watch?v=6R4jGTw5owM") == "6R4jGTw5owM"
     assert video_id("https://youtu.be/6R4jGTw5owM?t=10") == "6R4jGTw5owM"
     assert is_youtube("https://youtu.be/6R4jGTw5owM")
@@ -707,6 +918,8 @@ def main(argv=None):
                    help="don't caption PDF pages")
     r.add_argument("--no-watermark", action="store_true",
                    help="don't stamp the repo line at the foot of PDF pages")
+    r.add_argument("--dry-run", action="store_true",
+                   help="show how the timestamps were understood, then exit")
     r.set_defaults(func=cmd_run)
 
     t = sub.add_parser("selftest", help="check the timestamp parser")
