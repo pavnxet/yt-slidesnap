@@ -1,6 +1,6 @@
 [project]
 name = "yt-slidesnap"
-version = "1.0.0"
+version = "1.1.0"
 description = "Turn a lecture video into a PDF of its slides, at the timestamps you give it."
 readme = "README.md"
 requires-python = ">=3.9"

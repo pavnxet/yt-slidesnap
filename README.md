@@ -74,6 +74,31 @@ answer cannot leak into the PDF, and the window can't drift across the next ques
 
 See [`examples/timestamps.txt`](examples/timestamps.txt) for a full list.
 
+## Web UI
+
+Prefer clicking to typing flags? There's a local web page — no account, no cloud, binds to
+`127.0.0.1` only:
+
+```bash
+yt-slidesnap serve
+```
+
+It opens `http://127.0.0.1:8765` in your browser. Paste the URL and the timestamps, click
+**Extract slides**, and watch the progress log. When it finishes you get a link to the PDF
+and a preview of the contact sheet, so you can check the picks without leaving the page.
+
+Output still lands in `./slidesnap-out/<video-id>/`. One run at a time; a second click while
+a run is in progress is rejected rather than started.
+
+| Flag | Default | |
+|---|---|---|
+| `--port N` | `8765` | falls back to any free port if taken |
+| `--host H` | `127.0.0.1` | local only by default |
+| `--no-open` | off | don't auto-open a browser window |
+
+It is a single-user local tool with no authentication — it serves the output folder of the
+current run and nothing else. Don't expose it to a network you don't trust.
+
 ## Why the frames come out clean
 
 Naively grabbing a frame tends to catch the presenter standing in front of the slide. So

@@ -22,11 +22,19 @@ ffmpeg seeks the resolved stream URL over HTTP byte ranges.
 
 ```bash
 python slidesnap.py run <url> --file examples/timestamps.txt
+python slidesnap.py serve          # local web UI on 127.0.0.1
 python slidesnap.py selftest
 ```
 
 ## Conventions and invariants
 
+- **Keep it standard-library only.** The web UI uses `http.server` on purpose. Do not reach
+  for Flask/FastAPI: "no extra install, works anywhere" is a feature of this tool.
+- **`run_pipeline()` is the only implementation of the pipeline.** The CLI and the web UI
+  both call it; `cmd_run` and `start_job` only differ in how they report progress. Never
+  let a second copy of the extraction logic appear in the server.
+- **Failures raise `SnapError`, not `sys.exit`.** `sys.exit` in a worker thread does not
+  stop anything useful, so anything user-facing that the server also runs must raise.
 - **Never add a `download()` function.** The tool's whole point is that the video is not
   stored. Frames are extracted by seeking the stream URL.
 - **Use the bundled ffmpeg**, `imageio_ffmpeg.get_ffmpeg_exe()`. Never fall back to
@@ -61,3 +69,18 @@ gitignored; do not `git add -f` them.
 `selftest` covers the parser. The frame-selection logic has no unit test - its check is the
 `auto_picked.png` contact sheet the tool writes on every run. Eyeball it before claiming a
 change works.
+
+For the web UI, exercise the real endpoints rather than trusting the page:
+
+```bash
+python slidesnap.py serve --no-open &
+curl -s localhost:8765/status                      # job state
+curl -s -X POST localhost:8765/run -H 'Content-Type: application/json' \
+     -d '{"url":"...","timestamps":"Q19 01:41:04 01:41:27"}'
+curl -s localhost:8765/status                      # poll until done
+curl -sI localhost:8765/file/<pdf>                 # must be application/pdf
+curl -s -o /dev/null -w '%{http_code}' 'localhost:8765/file/..%2Fslidesnap.py'   # must be 403
+```
+
+A run started from the page must produce the *same* picks as the same run from the CLI - if
+it doesn't, the server has grown its own copy of the pipeline.

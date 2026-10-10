@@ -7,6 +7,7 @@ screen. It saves a clean frame of each one and stitches them into a PDF.
     yt-slidesnap run <url> --file timestamps.txt
     yt-slidesnap run <url> --text "Q22: Question 01:34:21 | Answer 01:34:53 (C)"
     Get-Content timestamps.txt | yt-slidesnap run <url>
+    yt-slidesnap serve                    # local web UI at http://127.0.0.1:8765
 
 Each line needs an id and at least one hh:mm:ss stamp. The first is when the slide
 appears. Any stamps after it are ceilings and the earliest one wins, so a table
@@ -22,17 +23,23 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
+import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
 
 import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # bundled full build; never PATH ffmpeg
 UA = "Mozilla/5.0"
@@ -42,6 +49,10 @@ DEFAULT_FORMAT = "bv*[height<=1080]/b[height<=1080]/b"
 # requested them, and ffmpeg then gets HTTP 403. YouTube's `android` client is
 # the one that works; see README troubleshooting.
 YOUTUBE_CLIENT = "android"
+
+
+class SnapError(Exception):
+    """A failure the user should read, rather than a traceback."""
 
 STAMP = re.compile(r"\d{1,2}:\d{2}:\d{2}")
 ID = re.compile(r"^\s*(?:question\s*)?(Q?\d+)\b", re.I)
@@ -117,7 +128,7 @@ def resolve_stream(url: str, client: str, fmt: str) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     lines = (proc.stdout or "").strip().splitlines()
     if not lines:
-        sys.exit(
+        raise SnapError(
             "could not resolve a stream URL.\n"
             "  * try another client:      --client android_vr | tv_embedded | ios\n"
             "  * try another format:      --format 'best[height<=720]'\n"
@@ -183,7 +194,7 @@ def run_one(stream, cand_dir, item, k, override):
 def build_output(results, outdir, label=True):
     picked = [(q, p, s) for q, p, _sc, s, _n in results if p]
     if not picked:
-        sys.exit("no frames were extracted - nothing to build")
+        raise SnapError("no frames were extracted - nothing to build")
 
     frames_dir = os.path.join(outdir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
@@ -222,6 +233,51 @@ def contact_sheet(picked, outdir, cols=4, thumb=(640, 360)):
 # --------------------------------------------------------------------------- commands
 
 
+def _overrides(specs):
+    out = {}
+    for spec in specs or []:
+        key, _, val = spec.partition("=")
+        out[key.strip().upper()] = int(val)
+    return out
+
+
+def run_pipeline(url, items, outdir, frames=8, workers=4, client=YOUTUBE_CLIENT,
+                 fmt=DEFAULT_FORMAT, overrides=None, label=True, progress=None):
+    """Extract every slide and build the PDF. Shared by the CLI and the web UI.
+
+    `progress` is called with one human-readable line at a time, from worker
+    threads as well as this one.
+    """
+    say = progress or (lambda _msg: None)
+    overrides = overrides or {}
+    cand_dir = os.path.join(outdir, "candidates")
+    os.makedirs(cand_dir, exist_ok=True)
+
+    say("resolving stream URL ...")
+    stream = resolve_stream(url, client, fmt)
+    say("stream resolved, extracting frames ...")
+
+    def one(item):
+        qid, path, scores, start, note = run_one(
+            stream, cand_dir, item, frames, overrides.get(item[0]))
+        detail = ""
+        if scores is not None:
+            # a picked score close to the worst means every candidate was dirty
+            detail = f" (error {scores.min():.1f} vs worst {scores.max():.1f})"
+        say(f"{qid}: {note}{detail}")
+        return qid, path, scores, start, note
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(one, items))
+
+    pdf, picked = build_output(results, outdir, label=label)
+    sheet = contact_sheet(picked, outdir)
+    if len(picked) < len(items):
+        say(f"WARNING: {len(items) - len(picked)} slide(s) produced no frames")
+    say(f"pdf: {os.path.basename(pdf)} ({len(picked)} pages)")
+    return pdf, sheet, picked
+
+
 def cmd_run(args):
     text = args.text
     if args.file:
@@ -237,37 +293,21 @@ def cmd_run(args):
         sys.exit("could not parse any timestamps - expected hh:mm:ss somewhere on each line")
 
     outdir = args.out or os.path.join(os.getcwd(), "slidesnap-out", video_id(args.url))
-    cand_dir = os.path.join(outdir, "candidates")
-    os.makedirs(cand_dir, exist_ok=True)
-
-    overrides = {}
-    for spec in args.override or []:
-        key, _, val = spec.partition("=")
-        overrides[key.strip().upper()] = int(val)
-
     print(f"url  : {args.url}")
     print(f"out  : {outdir}")
     print(f"found: {len(items)} slides ({items[0][0]}..{items[-1][0]})")
-    stream = resolve_stream(args.url, args.client, args.format)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        results = list(pool.map(
-            lambda it: run_one(stream, cand_dir, it, args.frames, overrides.get(it[0])),
-            items,
-        ))
-    for qid, _p, scores, _start, note in results:
-        extra = ""
-        if scores is not None:
-            # a picked score close to the worst means every candidate was dirty
-            extra = f"  (error {scores.min():.1f} vs worst {scores.max():.1f})"
-        print(f"  {qid}: {note}{extra}")
+    try:
+        pdf, sheet, picked = run_pipeline(
+            args.url, items, outdir, frames=args.frames, workers=args.workers,
+            client=args.client, fmt=args.format, overrides=_overrides(args.override),
+            label=not args.no_label, progress=lambda m: print(f"  {m}"),
+        )
+    except SnapError as exc:
+        sys.exit(str(exc))
 
-    pdf, picked = build_output(results, outdir, label=not args.no_label)
-    sheet = contact_sheet(picked, outdir)
     print(f"\npdf  : {pdf}  ({len(picked)} pages)")
     print(f"check: {sheet}")
-    if len(picked) < len(items):
-        print(f"WARNING: {len(items) - len(picked)} slide(s) produced no frames")
 
 
 def cmd_selftest(_args):
@@ -318,6 +358,228 @@ def cmd_selftest(_args):
     print("selftest ok")
 
 
+# --------------------------------------------------------------------------- web ui
+
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>yt-slidesnap</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;padding:36px 20px;background:#14161a;color:#e6e8eb;
+     font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:880px;margin:0 auto}
+h1{font-size:21px;margin:0 0 4px}
+h1 span{color:#60a5fa}
+p.sub{margin:0 0 26px;color:#8b93a1}
+label{display:block;font-weight:600;margin:18px 0 6px;font-size:12px;
+      text-transform:uppercase;letter-spacing:.05em;color:#a8b0bd}
+input,textarea{width:100%;padding:11px 13px;border-radius:8px;border:1px solid #2c313a;
+     background:#1b1e24;color:#e6e8eb;font:inherit}
+textarea{min-height:190px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+input:focus,textarea:focus{outline:2px solid #3b82f6;outline-offset:-1px;border-color:transparent}
+.row{display:flex;gap:18px}.row>div{flex:1}
+button{margin-top:22px;padding:12px 24px;border:0;border-radius:8px;background:#3b82f6;
+     color:#fff;font:600 15px inherit;cursor:pointer}
+button:hover:not(:disabled){background:#2f74e0}
+button:disabled{background:#2c313a;color:#6b7280;cursor:default}
+#status{margin-top:14px;font-weight:600;min-height:22px}
+.err{color:#f87171}.ok{color:#4ade80}
+pre{margin-top:16px;padding:14px;border-radius:8px;background:#0d0f12;border:1px solid #23272e;
+    max-height:260px;overflow:auto;font:12px/1.6 ui-monospace,Consolas,monospace;color:#9fb3c8}
+#result{margin-top:28px;padding-top:22px;border-top:1px solid #23272e}
+a{color:#60a5fa}
+img{width:100%;border-radius:8px;margin-top:16px;border:1px solid #23272e}
+</style></head><body><main>
+<h1>yt-<span>slidesnap</span></h1>
+<p class="sub">Paste a video URL and your timestamps. You get back a PDF of the slides.</p>
+
+<label for="url">Video URL</label>
+<input id="url" placeholder="https://youtu.be/...">
+
+<label for="ts">Timestamps &mdash; one slide per line</label>
+<textarea id="ts" placeholder="Q22: Question 01:34:21 | Answer 01:34:53 (C)&#10;&#10;Markdown tables work too:&#10;| Q19 | 01:41:04 | 01:44:16 | 01:41:27 | C |"></textarea>
+
+<div class="row"><div>
+  <label for="frames">Candidates per slide</label>
+  <input id="frames" type="number" min="1" max="32" value="8">
+</div></div>
+
+<button id="go">Extract slides</button>
+<div id="status"></div>
+<pre id="log" hidden></pre>
+
+<div id="result" hidden>
+  <div>PDF: <a id="pdf" href="#" target="_blank" rel="noopener"></a></div>
+  <img id="sheet" alt="contact sheet of the picked frames">
+</div>
+</main><script>
+const $ = s => document.querySelector(s);
+const say = (t, c) => { const e = $('#status'); e.textContent = t; e.className = c || ''; };
+
+$('#go').onclick = async () => {
+  $('#result').hidden = true;
+  $('#log').hidden = false;
+  $('#log').textContent = '';
+  say('starting...');
+  const r = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url: $('#url').value.trim(),
+                          timestamps: $('#ts').value,
+                          frames: +$('#frames').value})});
+  const j = await r.json();
+  if (j.error) { say(j.error, 'err'); return; }
+  $('#go').disabled = true;
+  poll();
+};
+
+async function poll() {
+  let s;
+  try { s = await (await fetch('/status')).json(); }
+  catch (e) { say('lost contact with the server', 'err'); $('#go').disabled = false; return; }
+  if (s.log.length) {
+    $('#log').textContent = s.log.join('\\n');
+    $('#log').scrollTop = $('#log').scrollHeight;
+  }
+  if (!s.done) { say('working...'); setTimeout(poll, 600); return; }
+  $('#go').disabled = false;
+  if (s.error) { say(s.error, 'err'); return; }
+  say('done - ' + s.pages + ' page' + (s.pages === 1 ? '' : 's'), 'ok');
+  $('#pdf').href = '/file/' + encodeURIComponent(s.pdf);
+  $('#pdf').textContent = s.pdf;
+  $('#sheet').src = '/file/' + encodeURIComponent(s.sheet) + '?t=' + Date.now();
+  $('#result').hidden = false;
+}
+</script></body></html>
+"""
+
+JOB = {"running": False, "done": False, "log": [], "error": None,
+       "outdir": None, "pdf": None, "sheet": None, "pages": 0}
+JOB_LOCK = threading.Lock()
+
+
+def start_job(payload):
+    """Kick off a run in the background. Returns an error string, or None."""
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return "paste a video URL first"
+    items = parse_block(payload.get("timestamps") or "")
+    if not items:
+        return "no timestamps found - each line needs an hh:mm:ss"
+    try:
+        frames = max(1, min(int(payload.get("frames") or 8), 32))
+    except (TypeError, ValueError):
+        return "candidates must be a whole number"
+
+    with JOB_LOCK:
+        if JOB["running"]:
+            return "a run is already in progress"
+        JOB.update({"running": True, "done": False, "log": [], "error": None,
+                    "outdir": None, "pdf": None, "sheet": None, "pages": 0})
+
+    outdir = os.path.join(os.getcwd(), "slidesnap-out", video_id(url))
+
+    def work():
+        def say(msg):
+            with JOB_LOCK:
+                JOB["log"].append(msg)
+
+        def finish(**kw):
+            with JOB_LOCK:
+                JOB.update(kw)
+                JOB["running"] = False
+                JOB["done"] = True
+
+        try:
+            pdf, sheet, picked = run_pipeline(url, items, outdir, frames=frames,
+                                              progress=say)
+            finish(outdir=outdir, pdf=os.path.basename(pdf),
+                   sheet=os.path.basename(sheet), pages=len(picked))
+        except Exception as exc:  # never let a worker kill the server
+            say(f"error: {exc}")
+            finish(error=str(exc))
+
+    threading.Thread(target=work, daemon=True).start()
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "yt-slidesnap"
+
+    def log_message(self, *args):
+        pass  # keep the console quiet; the page shows progress
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(200, PAGE)
+        elif path == "/status":
+            with JOB_LOCK:
+                self._json(200, dict(JOB))
+        elif path.startswith("/file/"):
+            self._serve_file(unquote(path[len("/file/"):]))
+        else:
+            self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/run":
+            self._send(404, "not found", "text/plain")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, TypeError):
+            self._json(400, {"error": "malformed request"})
+            return
+        error = start_job(payload)
+        self._json(409 if error else 200, {"error": error} if error else {"ok": True})
+
+    def _serve_file(self, rel):
+        """Serve only inside the current run's output folder."""
+        with JOB_LOCK:
+            outdir = JOB["outdir"]
+        if not outdir:
+            self._send(404, "no output yet", "text/plain")
+            return
+        root = os.path.realpath(outdir)
+        target = os.path.realpath(os.path.join(root, rel))
+        if target != root and not target.startswith(root + os.sep):
+            self._send(403, "forbidden", "text/plain")  # no traversal out of the run
+            return
+        if not os.path.isfile(target):
+            self._send(404, "not found", "text/plain")
+            return
+        with open(target, "rb") as fh:
+            self._send(200, fh.read(), mimetypes.guess_type(target)[0] or "application/octet-stream")
+
+
+def cmd_serve(args):
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError:  # port taken - take any free one instead of failing
+        httpd = ThreadingHTTPServer((args.host, 0), Handler)
+    url = f"http://{args.host}:{httpd.server_address[1]}/"
+    print(f"yt-slidesnap web UI on {url}")
+    print("ctrl-c to stop")
+    print(f"output goes to {os.path.join(os.getcwd(), 'slidesnap-out')}")
+    if not args.no_open:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="yt-slidesnap", description=__doc__,
@@ -346,6 +608,15 @@ def main(argv=None):
 
     t = sub.add_parser("selftest", help="check the timestamp parser")
     t.set_defaults(func=cmd_selftest)
+
+    s = sub.add_parser("serve", help="run the local web UI")
+    s.add_argument("--host", default="127.0.0.1",
+                   help="interface to bind (default 127.0.0.1, local only)")
+    s.add_argument("--port", type=int, default=8765,
+                   help="port (default 8765; falls back to a free one if taken)")
+    s.add_argument("--no-open", action="store_true",
+                   help="don't open a browser window")
+    s.set_defaults(func=cmd_serve)
 
     args = ap.parse_args(argv)
     args.func(args)
