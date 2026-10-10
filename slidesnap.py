@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """yt-slidesnap - turn a lecture video into a PDF of its slides.
 
 You give it a video URL and the timestamps where each question (or slide) is on
@@ -39,7 +39,7 @@ import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # bundled full build; never PATH ffmpeg
 UA = "Mozilla/5.0"
@@ -196,8 +196,8 @@ def _id_span(line):
     return (a, b)
 
 
-def _label(line, row, stamps, fallback):
-    """Slide id: a row's first cell, a leading Q-number, or a short word label."""
+def _label(line, row, stamps):
+    """Slide id, or None when the line carries no recognisable one."""
     if row:
         cell = row[0]
         m = CELL_ID.match(cell)
@@ -205,19 +205,19 @@ def _label(line, row, stamps, fallback):
             return f"Q{m.group(1)}"
         if 0 < len(cell) <= 24 and not cell[0].isdigit():
             return cell  # a worded row label, e.g. "Intro"
-        return fallback
+        return None
     m = LEAD_ID.match(line)
     if m and not any(a <= m.start(1) < b for a, b, _ in stamps):
         return f"Q{m.group(1)}"  # not a bare-seconds stamp mistaken for an id
     if stamps:
-        head = line[:stamps[0][0]].strip(" \t-–—:|.,()]#")
+        head = line[:stamps[0][0]].strip(" \t-â€“â€”:|.,()]#")
         # must actually look like a label, or a URL's prefix becomes an id
         if WORDY.fullmatch(head) and head.lower() not in NOISE:
             return head  # e.g. "Intro - 00:05:00"
-    return fallback
+    return None
 
 
-def parse_block(text: str):
+def parse_block(text: str, notes=None):
     """Parse a pasted timestamp list -> [(id, slide_sec, ceiling_sec_or_None)].
 
     The first stamp on a line is when the slide appears. The ceiling is the
@@ -225,12 +225,15 @@ def parse_block(text: str):
     several later stamps (answer discussion, correct-option reveal) in any column
     order, and a slide is only clean until the first thing happens to it.
 
-    Ids are de-duplicated and the result is sorted by start time.
+    Ids are de-duplicated and the result is sorted by start time. If `notes` is a
+    list, caveats about the interpretation are appended to it - a bare list of
+    timestamps still parses, but it loses both the video's numbering and the
+    answer ceiling, and that should be said out loud rather than discovered later.
     """
     # Windows editors happily save as "UTF-8 with BOM"; left in place it becomes
     # part of line 1 and quietly costs that line its id.
     text = text.replace("\ufeff", "")
-    out = []
+    out, auto = [], 0
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -254,7 +257,9 @@ def parse_block(text: str):
             continue
         start = stamps[0][2]
         later = [s[2] for s in stamps[1:] if s[2] > start]
-        out.append((_label(line, row, stamps, f"Q{len(out) + 1}"), start,
+        label = _label(line, row, stamps)
+        auto += label is None
+        out.append((label or f"Q{len(out) + 1}", start,
                     min(later) if later else None))
 
     seen, uniq = set(), []
@@ -268,6 +273,19 @@ def parse_block(text: str):
     for qid, start, end in uniq:
         counts[qid] = counts.get(qid, 0) + 1
         fixed.append((qid if counts[qid] == 1 else f"{qid}-{counts[qid]}", start, end))
+
+    if notes is not None:
+        if auto:
+            notes.append(
+                f"{auto} line(s) had no id, so they were numbered by position "
+                f"(Q1, Q2, ...). That will not match the video's own numbering - "
+                f"start each line with an id, e.g. 'Q19 01:41:04'.")
+        opened = sum(1 for _q, _s, e in fixed if e is None)
+        if opened:
+            notes.append(
+                f"{opened} line(s) gave no end timestamp, so a 30s window was used. "
+                f"A window that long can run past the answer and capture it - add the "
+                f"answer time, e.g. 'Q19 01:41:04 01:41:27'.")
 
     return sorted(fixed, key=lambda it: it[1])
 
@@ -518,7 +536,8 @@ def cmd_run(args):
     if not text:
         sys.exit("no timestamps given - use --file, --text, or pipe them on stdin")
 
-    items = parse_block(text)
+    notes = []
+    items = parse_block(text, notes)
     if not items:
         sys.exit("could not parse any timestamps - expected hh:mm:ss somewhere on each line")
 
@@ -526,6 +545,8 @@ def cmd_run(args):
     print(f"url  : {args.url}")
     print(f"out  : {outdir}")
     print(f"found: {len(items)} slides ({items[0][0]}..{items[-1][0]})")
+    for note in notes:
+        print(f"note : {note}")
 
     if args.dry_run:
         # the parser accepts many shapes, so show what it decided before spending
@@ -641,6 +662,18 @@ def cmd_selftest(_args):
     # a UTF-8 BOM must not cost the first line its id
     assert parse_block("\ufeffQ22: Question 01:34:21 | Answer 01:34:53 (C)")[0] == \
         ("Q22", 5661, 5693)
+
+    # a bare list of timestamps still parses, but both caveats must be reported
+    notes = []
+    bare = parse_block("01:41:04\n01:47:56\nQ3 01:57:02 01:57:26", notes)
+    assert [b[0] for b in bare] == ["Q1", "Q2", "Q3"], bare
+    assert len(notes) == 2, notes
+    assert any("numbered by position" in n for n in notes), notes
+    assert any("no end timestamp" in n for n in notes), notes
+    # a fully specified list is quiet
+    quiet = []
+    parse_block("Q19 01:41:04 01:41:27\nQ20 01:47:56 01:48:23", quiet)
+    assert quiet == [], quiet
     assert video_id("https://www.youtube.com/watch?v=6R4jGTw5owM") == "6R4jGTw5owM"
     assert video_id("https://youtu.be/6R4jGTw5owM?t=10") == "6R4jGTw5owM"
     assert is_youtube("https://youtu.be/6R4jGTw5owM")
@@ -774,7 +807,8 @@ def start_job(payload):
     url = (payload.get("url") or "").strip()
     if not url:
         return "paste a video URL first"
-    items = parse_block(payload.get("timestamps") or "")
+    notes = []
+    items = parse_block(payload.get("timestamps") or "", notes)
     if not items:
         return "no timestamps found - each line needs an hh:mm:ss"
     try:
@@ -802,6 +836,8 @@ def start_job(payload):
                 JOB["done"] = True
 
         try:
+            for note in notes:
+                say(f"note: {note}")
             pdf, sheet, picked = run_pipeline(url, items, outdir, frames=frames,
                                               progress=say)
             finish(outdir=outdir, pdf=os.path.basename(pdf),
