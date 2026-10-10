@@ -1,0 +1,29 @@
+# Tool output. NOTE: these are frames of someone else's video - never commit them.
+slidesnap-out/
+runs/
+out/
+frames/
+candidates/
+sheets/
+*.pdf
+auto_picked.png
+verify_pdf.png
+
+# Local workspace notes (not part of the tool)
+learning/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
