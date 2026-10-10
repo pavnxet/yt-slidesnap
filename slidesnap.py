@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """yt-slidesnap - turn a lecture video into a PDF of its slides.
 
 You give it a video URL and the timestamps where each question (or slide) is on
@@ -674,6 +674,22 @@ def cmd_selftest(_args):
     quiet = []
     parse_block("Q19 01:41:04 01:41:27\nQ20 01:47:56 01:48:23", quiet)
     assert quiet == [], quiet
+
+    # A BOM or bad syntax in pyproject.toml breaks `pip install` for everyone and
+    # stays invisible until someone tries it. It shipped once - a BOM-writing
+    # editor did it. Cheap to assert here; do not remove.
+    manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml")
+    if os.path.exists(manifest):
+        with open(manifest, "rb") as fh:
+            raw = fh.read()
+        assert not raw.startswith(b"\xef\xbb\xbf"), "pyproject.toml has a UTF-8 BOM"
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None  # py3.10 and older
+        if tomllib:
+            tomllib.loads(raw.decode("utf-8"))
+
     assert video_id("https://www.youtube.com/watch?v=6R4jGTw5owM") == "6R4jGTw5owM"
     assert video_id("https://youtu.be/6R4jGTw5owM?t=10") == "6R4jGTw5owM"
     assert is_youtube("https://youtu.be/6R4jGTw5owM")
