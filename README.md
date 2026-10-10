@@ -129,6 +129,10 @@ slidesnap-out/<video-id>/
 └── candidates/        all 8 candidates per slide, for re-picking
 ```
 
+Each page is `[Q22  at 1:34:21]` on top, the slide, then `Made with ❤ by
+github.com/pavnxet/yt-slidesnap` in the footer strip. Both strips sit outside the slide, so
+neither ever covers the question. Turn either off with `--no-label` / `--no-watermark`.
+
 ## Flags
 
 | Flag | Default | |
@@ -140,6 +144,7 @@ slidesnap-out/<video-id>/
 | `--client NAME` | `android` | yt-dlp `player_client` for YouTube |
 | `--format SEL` | `bv*[height<=1080]/...` | yt-dlp format selector |
 | `--no-label` | off | don't caption pages with `Q22  at 1:34:21` |
+| `--no-watermark` | off | don't stamp the repo line at the foot of pages |
 
 ## Troubleshooting
 

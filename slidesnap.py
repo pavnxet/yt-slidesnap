@@ -37,9 +37,9 @@ from urllib.parse import unquote, urlparse
 
 import imageio_ffmpeg
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # bundled full build; never PATH ffmpeg
 UA = "Mozilla/5.0"
@@ -57,6 +57,25 @@ class SnapError(Exception):
 STAMP = re.compile(r"\d{1,2}:\d{2}:\d{2}")
 ID = re.compile(r"^\s*(?:question\s*)?(Q?\d+)\b", re.I)
 YT_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{11})")
+
+# Branding. The heart is U+2764 only - the emoji variation selector U+FE0F is a
+# separate codepoint many text fonts lack, and it renders as a box when missing.
+REPO = "github.com/pavnxet/yt-slidesnap"
+REPO_URL = "https://" + REPO
+HEART = "\u2764"
+MARK = f"Made with {HEART} by {REPO}"
+MARK_FALLBACK = f"Made with love by {REPO}"
+
+# Fonts that might carry U+2764, best-guess order per platform. Chosen by
+# capability at runtime, never assumed - see small_font().
+MARK_FONTS = (
+    r"C:\Windows\Fonts\seguisym.ttf",          # Segoe UI Symbol: has it
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+)
+CAP_H, MARK_H, TEXT = 30, 28, 15  # page header/footer strip heights, text size
 
 
 # --------------------------------------------------------------------------- input
@@ -190,23 +209,80 @@ def run_one(stream, cand_dir, item, k, override):
 
 # --------------------------------------------------------------------------- output
 
+_FONT_CACHE = {}
 
-def build_output(results, outdir, label=True):
+
+def small_font(size=TEXT):
+    """Small font for the page caption and watermark -> (font, heart_ok).
+
+    Picked by capability, not by assumption: each candidate is test-drawn and
+    compared against a guaranteed-missing codepoint, so a font that would render
+    the heart as a tofu box is rejected rather than shipped.
+    """
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+
+    def draw(font, ch):
+        im = Image.new("L", (48, 48), 0)
+        ImageDraw.Draw(im).text((0, 0), ch, font=font, fill=255)
+        return im.tobytes()
+
+    def has_heart(font):
+        try:
+            return draw(font, HEART) != draw(font, "\uffff")
+        except Exception:
+            return False
+
+    chosen, ok = None, False
+    for path in MARK_FONTS:
+        if not os.path.exists(path):
+            continue
+        try:
+            font = ImageFont.truetype(path, size)
+        except Exception:
+            continue
+        if chosen is None:
+            chosen = font
+        if has_heart(font):
+            chosen, ok = font, True
+            break
+    if chosen is None:
+        try:
+            chosen = ImageFont.load_default(size=size)  # Pillow >= 10.1
+        except TypeError:
+            chosen = ImageFont.load_default()
+        ok = has_heart(chosen)
+    _FONT_CACHE[size] = (chosen, ok)
+    return chosen, ok
+
+
+def build_output(results, outdir, label=True, watermark=True):
     picked = [(q, p, s) for q, p, _sc, s, _n in results if p]
     if not picked:
         raise SnapError("no frames were extracted - nothing to build")
 
     frames_dir = os.path.join(outdir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
+    font, heart_ok = small_font()
+    mark = MARK if heart_ok else MARK_FALLBACK
+
     pages = []
     for qid, path, start in picked:
         im = Image.open(path).convert("RGB")
         im = im.resize((im.width * 2, im.height * 2), Image.LANCZOS)
-        if label:
-            clock = f"{start // 3600}:{start % 3600 // 60:02d}:{start % 60:02d}"
-            page = Image.new("RGB", (im.width, im.height + 26), (18, 18, 18))
-            page.paste(im, (0, 26))
-            ImageDraw.Draw(page).text((6, 7), f"{qid}    at {clock}", fill="#ffcc00")
+        head = CAP_H if label else 0
+        foot = MARK_H if watermark else 0
+        if head or foot:
+            page = Image.new("RGB", (im.width, im.height + head + foot), (18, 18, 18))
+            page.paste(im, (0, head))
+            draw = ImageDraw.Draw(page)
+            if label:
+                clock = f"{start // 3600}:{start % 3600 // 60:02d}:{start % 60:02d}"
+                draw.text((10, 6), f"{qid}    at {clock}", fill="#ffcc00", font=font)
+            if watermark:
+                width = draw.textlength(mark, font=font)
+                draw.text(((im.width - width) / 2, im.height + head + 5),
+                          mark, fill="#7b8494", font=font)
             im = page
         im.save(os.path.join(frames_dir, f"{qid}.png"))
         pages.append(im)
@@ -243,7 +319,8 @@ def _overrides(specs):
 
 
 def run_pipeline(url, items, outdir, frames=8, workers=4, client=YOUTUBE_CLIENT,
-                 fmt=DEFAULT_FORMAT, overrides=None, label=True, progress=None):
+                 fmt=DEFAULT_FORMAT, overrides=None, label=True, watermark=True,
+                 progress=None):
     """Extract every slide and build the PDF. Shared by the CLI and the web UI.
 
     `progress` is called with one human-readable line at a time, from worker
@@ -271,7 +348,7 @@ def run_pipeline(url, items, outdir, frames=8, workers=4, client=YOUTUBE_CLIENT,
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(one, items))
 
-    pdf, picked = build_output(results, outdir, label=label)
+    pdf, picked = build_output(results, outdir, label=label, watermark=watermark)
     sheet = contact_sheet(picked, outdir)
     if len(picked) < len(items):
         say(f"WARNING: {len(items) - len(picked)} slide(s) produced no frames")
@@ -302,7 +379,8 @@ def cmd_run(args):
         pdf, sheet, picked = run_pipeline(
             args.url, items, outdir, frames=args.frames, workers=args.workers,
             client=args.client, fmt=args.format, overrides=_overrides(args.override),
-            label=not args.no_label, progress=lambda m: print(f"  {m}"),
+            label=not args.no_label, watermark=not args.no_watermark,
+            progress=lambda m: print(f"  {m}"),
         )
     except SnapError as exc:
         sys.exit(str(exc))
@@ -356,6 +434,20 @@ def cmd_selftest(_args):
     assert video_id("https://youtu.be/6R4jGTw5owM?t=10") == "6R4jGTw5owM"
     assert is_youtube("https://youtu.be/6R4jGTw5owM")
     assert not is_youtube("https://example.com/lecture.mp4")
+
+    # a machine with none of the candidate fonts must still render a page, just
+    # without the heart - the tofu box is the failure this guards against
+    global MARK_FONTS
+    saved, MARK_FONTS = MARK_FONTS, ()
+    _FONT_CACHE.clear()
+    try:
+        font, heart_ok = small_font()
+        assert font is not None, "fallback font must still be a usable font"
+        assert heart_ok is False, "no candidate font exists, so no heart"
+        assert HEART not in MARK_FALLBACK, MARK_FALLBACK
+        assert REPO in MARK_FALLBACK and REPO in MARK, "branding must keep the repo"
+    finally:
+        MARK_FONTS, _ = saved, _FONT_CACHE.clear()
     print("selftest ok")
 
 
@@ -391,6 +483,11 @@ pre{margin-top:16px;padding:14px;border-radius:8px;background:#0d0f12;border:1px
 #result{margin-top:28px;padding-top:22px;border-top:1px solid #23272e}
 a{color:#60a5fa}
 img{width:100%;border-radius:8px;margin-top:16px;border:1px solid #23272e}
+footer{margin-top:36px;padding-top:18px;border-top:1px solid #23272e;text-align:center;
+       color:#6b7280;font-size:13px}
+footer .h{color:#e0556b}
+footer a{color:#8b93a1;text-decoration:none;border-bottom:1px solid #2c313a}
+footer a:hover{color:#60a5fa;border-bottom-color:#60a5fa}
 </style></head><body><main>
 <h1>yt-<span>slidesnap</span></h1>
 <p class="sub">Paste a video URL and your timestamps. You get back a PDF of the slides.</p>
@@ -414,6 +511,9 @@ img{width:100%;border-radius:8px;margin-top:16px;border:1px solid #23272e}
   <div>PDF: <a id="pdf" href="#" target="_blank" rel="noopener"></a></div>
   <img id="sheet" alt="contact sheet of the picked frames">
 </div>
+
+<footer>Made with <span class="h">&#10084;</span> by
+  <a href="__REPO_URL__" target="_blank" rel="noopener">__REPO__</a></footer>
 </main><script>
 const $ = s => document.querySelector(s);
 const say = (t, c) => { const e = $('#status'); e.textContent = t; e.className = c || ''; };
@@ -451,7 +551,7 @@ async function poll() {
   $('#result').hidden = false;
 }
 </script></body></html>
-"""
+""".replace("__REPO_URL__", REPO_URL).replace("__REPO__", REPO)
 
 JOB = {"running": False, "done": False, "log": [], "error": None,
        "outdir": None, "pdf": None, "sheet": None, "pages": 0}
@@ -605,6 +705,8 @@ def main(argv=None):
                    help="force candidate N for a slide, e.g. --override Q22=3")
     r.add_argument("--no-label", action="store_true",
                    help="don't caption PDF pages")
+    r.add_argument("--no-watermark", action="store_true",
+                   help="don't stamp the repo line at the foot of PDF pages")
     r.set_defaults(func=cmd_run)
 
     t = sub.add_parser("selftest", help="check the timestamp parser")

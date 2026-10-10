@@ -35,6 +35,13 @@ python slidesnap.py selftest
   let a second copy of the extraction logic appear in the server.
 - **Failures raise `SnapError`, not `sys.exit`.** `sys.exit` in a worker thread does not
   stop anything useful, so anything user-facing that the server also runs must raise.
+- **Never assume a font can draw a glyph.** `small_font()` test-draws U+2764 and compares it
+  against a guaranteed-missing codepoint, because a font without the glyph renders a tofu box
+  rather than failing. The branding line falls back to `MARK_FALLBACK` (no heart) when no
+  candidate font qualifies. Use `HEART` (U+2764) alone, never the emoji pair `U+2764 U+FE0F`:
+  the variation selector is a second codepoint most text fonts lack.
+- **Branding lives in `REPO` / `MARK` and is substituted into `PAGE` by `.replace()`.** The
+  page is not an f-string on purpose: its CSS is full of braces.
 - **Never add a `download()` function.** The tool's whole point is that the video is not
   stored. Frames are extracted by seeking the stream URL.
 - **Use the bundled ffmpeg**, `imageio_ffmpeg.get_ffmpeg_exe()`. Never fall back to
